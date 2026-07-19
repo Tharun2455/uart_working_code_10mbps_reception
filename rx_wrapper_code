@@ -1,0 +1,217 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity UART_10Byte_XOR_80Bit is
+  generic (
+    -- 100 MHz System Clock / 10 Mbps Baud Rate = 10 Clocks Per Bit
+    g_CLKS_PER_BIT : integer := 10 
+  );
+  port (
+    i_Clk           : in  std_logic;
+    i_Rst           : in  std_logic;
+    i_RX_Serial     : in  std_logic;
+    
+    -- Status Indicators
+    o_Packet_Valid  : out std_logic;                  
+    o_Header_Error  : out std_logic;                  
+    o_Csum_Error    : out std_logic;                  
+    
+    -- Stored complete packet data (Flattened 80-bit vector)
+    o_Packet_Data   : out std_logic_vector(79 downto 0) 
+  );
+end UART_10Byte_XOR_80Bit;
+
+architecture Behavioral of UART_10Byte_XOR_80Bit is
+
+  component UART_RX is
+    generic ( g_CLKS_PER_BIT : integer := 10 );
+    port (
+      i_Clk        : in  std_logic;
+      i_RX_Serial  : in  std_logic;
+      o_RX_DV      : out std_logic;
+      o_RX_Byte    : out std_logic_vector(7 downto 0)
+    );
+  end component;
+
+  signal w_RX_DV          : std_logic;
+  signal w_RX_Byte        : std_logic_vector(7 downto 0);
+  signal r_RX_Sync        : std_logic_vector(1 downto 0) := "11";
+
+  -- Single-cycle edge detection strobe for 10 Mbps stream handling
+  signal r_RX_DV_d1       : std_logic := '0';
+  signal w_RX_DV_Pulse    : std_logic;
+
+  type t_Parse_State is (
+    s_Word_Ideal, 
+    s_Word_Get_Pkg_ID, 
+    s_Word_Collect_Payload, 
+    s_Word_Verify_Checksum, 
+    s_Word_Pulse_Stretcher
+  );
+  signal r_State : t_Parse_State := s_Word_Ideal;
+
+  type t_Packet_Storage is array (0 to 9) of std_logic_vector(7 downto 0);
+  signal r_Storage      : t_Packet_Storage := (others => (others => '0'));
+  
+  signal r_Byte_Index   : integer range 0 to 63 := 0;
+  signal r_Strobe_Count : integer range 0 to 7 := 0;
+  signal r_Checksum     : std_logic_vector(7 downto 0) := (others => '0');
+
+  signal r_Pkg_Identifier_s : std_logic_vector(7 downto 0) := (others => '0');
+  signal w_Packet_Size      : integer range 0 to 255;
+
+  signal r_Header_Error : std_logic := '0';
+  signal r_Csum_Error   : std_logic := '0';
+  signal r_Packet_Valid : std_logic := '0';
+
+begin
+
+  -- Formula: Size = (Pkg_ID * 5) + 10
+  w_Packet_Size <= (to_integer(unsigned(r_Pkg_Identifier_s)) * 5) + 10;
+
+  -- Double Flop Synchronizer for Metastability
+  p_Synchronizer : process (i_Clk)
+  begin
+    if rising_edge(i_Clk) then
+      r_RX_Sync <= r_RX_Sync(0) & i_RX_Serial;
+    end if;
+  end process p_Synchronizer;
+
+  -- Base UART Receiver Instance (Configured with 10 Clocks Per Bit)
+  UART_RX_Inst : UART_RX
+    generic map ( g_CLKS_PER_BIT => g_CLKS_PER_BIT )
+    port map (
+      i_Clk       => i_Clk,
+      i_RX_Serial => r_RX_Sync(1),
+      o_RX_DV     => w_RX_DV,
+      o_RX_Byte   => w_RX_Byte
+    );
+
+  -- ==========================================================================
+  -- 1. Edge Strobe Generation Process
+  -- ==========================================================================
+  p_Edge_Detect : process (i_Clk)
+  begin
+    if rising_edge(i_Clk) then
+      if i_Rst = '1' then
+        r_RX_DV_d1 <= '0';
+      else
+        r_RX_DV_d1 <= w_RX_DV;
+      end if;
+    end if;
+  end process p_Edge_Detect;
+
+  -- High for exactly 1 clock cycle when a new byte is fully assembled
+  w_RX_DV_Pulse <= w_RX_DV and (not r_RX_DV_d1);
+
+  -- ==========================================================================
+  -- 2. Protocol Parsing State Machine Engine
+  -- ==========================================================================
+  p_Frame_Parser : process (i_Clk)
+  begin
+    if rising_edge(i_Clk) then
+      if i_Rst = '1' then
+        r_State            <= s_Word_Ideal;
+        r_Byte_Index       <= 0;
+        r_Strobe_Count     <= 0;
+        r_Checksum         <= (others => '0');
+        r_Header_Error     <= '0';
+        r_Csum_Error       <= '0';
+        r_Packet_Valid     <= '0';
+        r_Pkg_Identifier_s <= (others => '0');
+        r_Storage          <= (others => (others => '0'));
+      else
+        case r_State is
+
+          -- STATE: Ideal (Wait for first byte to trigger using edge pulse)
+          when s_Word_Ideal =>
+            r_Packet_Valid     <= '0';
+            r_Header_Error     <= '0';
+            r_Csum_Error       <= '0';
+            r_Byte_Index       <= 0;
+            r_Strobe_Count     <= 0;
+            r_Pkg_Identifier_s <= (others => '0');
+            
+            if w_RX_DV_Pulse = '1' then
+              if w_RX_Byte = X"AA" then
+                r_Storage(0)   <= w_RX_Byte;
+                r_Checksum     <= X"AA"; 
+                r_Byte_Index   <= 1;
+                r_State        <= s_Word_Get_Pkg_ID;
+              else
+                r_Header_Error <= '1'; 
+                r_State        <= s_Word_Ideal;
+              end if;
+            end if;
+
+          -- STATE: Dynamic Package ID Capture (Byte Index 1)
+          when s_Word_Get_Pkg_ID =>
+            if w_RX_DV_Pulse = '1' then
+              r_Pkg_Identifier_s <= w_RX_Byte; 
+              r_Storage(1)       <= w_RX_Byte;
+              r_Checksum         <= r_Checksum xor w_RX_Byte;
+              r_Byte_Index       <= 2;
+              r_State            <= s_Word_Collect_Payload;
+            end if;
+
+          -- STATE: Payload Accumulation Loop Phase
+          when s_Word_Collect_Payload =>
+            if w_RX_DV_Pulse = '1' then
+              -- Safely boundary-check the internal memory array
+              if r_Byte_Index < 10 then
+                r_Storage(r_Byte_Index) <= w_RX_Byte;
+              end if;
+
+              -- Accumulate running XOR parity until the final index byte
+              if r_Byte_Index < (w_Packet_Size - 1) then
+                r_Checksum <= r_Checksum xor w_RX_Byte;
+              end if;
+
+              -- Evaluate boundary tracking condition
+              if r_Byte_Index = (w_Packet_Size - 1) then
+                if r_Checksum = w_RX_Byte then
+                  r_Csum_Error <= '0';
+                  r_State      <= s_Word_Verify_Checksum;
+                else
+                  r_Csum_Error <= '1';
+                  r_State      <= s_Word_Ideal; 
+                end if;
+              else
+                r_Byte_Index <= r_Byte_Index + 1;
+              end if;
+            end if;
+
+          -- STATE: Checksum Verified Success Transition
+          when s_Word_Verify_Checksum =>
+            r_State <= s_Word_Pulse_Stretcher;
+
+          -- STATE: Strobe Stretcher (Stays high for 5 cycles)
+          when s_Word_Pulse_Stretcher =>
+            r_Packet_Valid <= '1'; 
+            if r_Strobe_Count < 4 then
+              r_Strobe_Count <= r_Strobe_Count + 1;
+            else
+              r_Strobe_Count <= 0;
+              r_Packet_Valid <= '0';
+              r_State        <= s_Word_Ideal;
+            end if;
+
+          when others =>
+            r_State <= s_Word_Ideal;
+        end case;
+      end if;
+    end if;
+  end process p_Frame_Parser;
+
+  -- Global Status Routing Assignments
+  o_Packet_Valid <= r_Packet_Valid;
+  o_Header_Error <= r_Header_Error;
+  o_Csum_Error   <= r_Csum_Error;
+  
+  -- Output Bus Assignment (Flattened 80-bit structure mapping)
+  o_Packet_Data <= r_Storage(9) & r_Storage(8) & r_Storage(7) & r_Storage(6) & 
+                   r_Storage(5) & r_Storage(4) & r_Storage(3) & r_Storage(2) & 
+                   r_Storage(1) & r_Storage(0);
+
+end Behavioral;
